@@ -1,0 +1,5 @@
+ 这是一条关于{"mask"}的评论：{"placeholder": "text_a"}，这条评论的情感倾向可能是友善的或者是恶意的
+ 一个{"mask"} 评论: {"placeholder": "text_a"}
+ {"placeholder": "text_a"} 这个评论是 {"mask"} .
+ 关于 {"placeholder": "text_a"} 的类别是 {"mask"}.
+ [ 类别 : {"mask"} ] {"placeholder": "text_a"}
