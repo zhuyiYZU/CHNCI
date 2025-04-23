@@ -6,7 +6,7 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 
 # 初始化 OpenAI 客户端
 client = OpenAI(
-    api_key="sk-fb7585d6d4e543cfb0dfe69c7410e1a0",
+    api_key="sk-****",
     base_url="https://api.deepseek.com"
 )
 
