@@ -59,7 +59,7 @@ def analyze_sentiment_and_update_csv(csv_file, client, output_csv_file):
 from openai import OpenAI
 
 client = OpenAI(
-    api_key="sk-qfllasqpccngetzdtocpvzvuwkuapbbzdstwqjtgvrdjghuu",  # 请替换为您的API密钥
+    api_key="sk-***",  # 请替换为您的API密钥
     base_url="https://api.siliconflow.cn/v1"
 )
 
