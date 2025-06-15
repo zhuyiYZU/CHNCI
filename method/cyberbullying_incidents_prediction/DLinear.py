@@ -17,19 +17,40 @@ output_dir = r"C:\Users\zxnb\Desktop\DLinear_res"
 os.makedirs(output_dir, exist_ok=True)  # 创建文件夹，如果不存在
 error_file_path = os.path.join(output_dir, "error_metrics.txt")
 
-# 定义 DLinear 模型
+# -------- 这里替换为真正的 DLinear 模型 --------
 class DLinear(nn.Module):
-    def __init__(self, input_size=6, output_size=1):
+    def __init__(self, seq_len=6, pred_len=1):
         super(DLinear, self).__init__()
-        self.linear = nn.Linear(input_size, output_size)
+        self.seq_len = seq_len
+        self.pred_len = pred_len
 
-    def forward(self, src):
-        # src: (batch_size, time_steps, 1)
-        src = src.squeeze(-1)  # 去掉最后一个维度，变成 (batch_size, time_steps)
-        return self.linear(src)  # 输出为 (batch_size, output_size)
+        # 趋势项和残差项分别建模
+        self.linear_trend = nn.Linear(self.seq_len, self.pred_len)
+        self.linear_residual = nn.Linear(self.seq_len, self.pred_len)
+
+    def decompose(self, x):
+        """
+        时间序列分解为趋势项和残差项
+        x: shape (batch_size, seq_len)
+        """
+        moving_avg = x.mean(dim=1, keepdim=True).repeat(1, self.seq_len)
+        trend = moving_avg
+        residual = x - trend
+        return trend, residual
+
+    def forward(self, x):
+        """
+        x: shape (batch_size, seq_len)
+        返回预测值 shape (batch_size, pred_len)
+        """
+        trend, residual = self.decompose(x)
+        trend_output = self.linear_trend(trend)
+        residual_output = self.linear_residual(residual)
+        return trend_output + residual_output
+# ----------------------------------------------
 
 # 定义滑动窗口函数
-time_steps = 6  # 使用过去6小时的数据预测未来的趋势
+time_steps = 6  # 使用过去6小时的数据预测未来趋势
 def create_sequences(data, time_steps=6):
     X, y = [], []
     for i in range(len(data) - time_steps):
@@ -38,11 +59,11 @@ def create_sequences(data, time_steps=6):
     return np.array(X), np.array(y)
 
 # 初始化 DLinear 模型
-model = DLinear(input_size=time_steps, output_size=1)
+model = DLinear(seq_len=time_steps, pred_len=1)
 loss_function = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-# 定义训练事件和文件夹路径
+# 训练事件和路径
 train_file_paths = {
     "遭教官体罚进ICU的14岁女孩离世": r"C:\Users\zxnb\Desktop\数据集(最终版)\res\res\遭教官体罚进ICU的14岁女孩离世.csv",
     "徐州多人占铁轨拍照逼停火车头(2)": r"C:\Users\zxnb\Desktop\数据集(最终版)\res\res\徐州多人占铁轨拍照逼停火车头(2).csv",
@@ -66,31 +87,29 @@ for event_name, file_path in train_file_paths.items():
     df['time'] = pd.to_datetime(df['timestamp'], errors='coerce')
     df = df.dropna(subset=['time'])
 
-    # 数据预处理
+    # 取恶意评论标签为1的数据，按小时聚合
     event_data = df[df['label3'] == 1].sort_values(by='time')
     hourly_data = event_data.resample('H', on='time').size().fillna(0).to_frame(name='malicious_count')
     scaler = MinMaxScaler()
     scaled_data = scaler.fit_transform(hourly_data)
 
-    # 生成训练数据
+    # 生成训练数据序列
     X, y = create_sequences(scaled_data, time_steps)
-    X = torch.from_numpy(X).float().unsqueeze(-1)  # (batch_size, time_steps, 1)
+    X = torch.from_numpy(X).float()  # (batch_size, time_steps)
     y = torch.from_numpy(y).float()  # (batch_size, 1)
 
-    # 模型训练
+    # 训练
     for epoch in range(20):
         total_loss = 0
         for i in range(len(X)):
             optimizer.zero_grad()
-            src = X[i].unsqueeze(0)
-            src = src.squeeze(-1).squeeze(-1) 
-             # (1, time_steps, 1)
-            y_pred = model(src)
-            single_loss = loss_function(y_pred, y[i].unsqueeze(0))
-            single_loss.backward()
+            src = X[i].unsqueeze(0)  # (1, time_steps)
+            y_pred = model(src)      # (1, pred_len=1)
+            loss = loss_function(y_pred, y[i].unsqueeze(0))
+            loss.backward()
             optimizer.step()
-            total_loss += single_loss.item()
-        print(f'Epoch {epoch+1}/10 | Average Loss for {event_name}: {total_loss/len(X):.6f}')
+            total_loss += loss.item()
+        print(f'Epoch {epoch+1}/20 | Average Loss for {event_name}: {total_loss/len(X):.6f}')
 
 # 测试部分
 mae_list = []
@@ -103,60 +122,56 @@ for test_event_name, test_file_path in test_file_paths.items():
     df['time'] = pd.to_datetime(df['timestamp'], errors='coerce')
     df = df.dropna(subset=['time'])
 
-    # 数据预处理
+    # 取恶意评论标签为1的数据，按小时聚合
     event_data = df[df['label3'] == 1].sort_values(by='time')
     hourly_data = event_data.resample('H', on='time').size().fillna(0).to_frame(name='malicious_count')
     scaled_data = scaler.transform(hourly_data)
 
-    # 创建测试数据
+    # 创建测试数据序列
     X_test = create_sequences(scaled_data, time_steps)[0]
-    X_test = torch.from_numpy(X_test).float().unsqueeze(-1)  # (batch_size, time_steps, 1)
+    X_test = torch.from_numpy(X_test).float()  # (batch_size, time_steps)
 
-    # 预测
     predictions = []
     with torch.no_grad():
         for seq in X_test:
-            src = seq.unsqueeze(0) 
-            src = src.squeeze(-1).squeeze(-1) # (1, time_steps, 1)
-            prediction = model(src).item()
-            predictions.append(prediction)
+            src = seq.unsqueeze(0)  # (1, time_steps)
+            pred = model(src).item()
+            predictions.append(pred)
 
     # 反标准化
     predictions = scaler.inverse_transform(np.array(predictions).reshape(-1, 1))
     true_values = scaler.inverse_transform(scaled_data[time_steps:])
 
-    # 计算误差指标
+    # 误差指标
     mae = mean_absolute_error(true_values, predictions)
     mse = mean_squared_error(true_values, predictions)
     rmse = np.sqrt(mse)
     mae_list.append(mae)
     mse_list.append(mse)
     rmse_list.append(rmse)
-    print(f"Mean Absolute Error (MAE): {mae:.4f}")
-    print(f"Mean Squared Error (MSE): {mse:.4f}")
-    print(f"Root Mean Squared Error (RMSE): {rmse:.4f}")
+    print(f"MAE: {mae:.4f}, MSE: {mse:.4f}, RMSE: {rmse:.4f}")
 
-    # 保存误差指标到文件
+    # 写入误差文件
     with open(error_file_path, "a") as f:
         f.write(f"Event: {test_event_name}\n")
         f.write(f"MAE: {mae:.4f}\n")
         f.write(f"RMSE: {rmse:.4f}\n")
         f.write("="*30 + "\n")
 
-    # 可视化预测结果并保存
+    # 画图保存
     plt.figure(figsize=(10, 6))
     plt.plot(true_values, label="True Values", color="blue")
     plt.plot(predictions, label="Predictions", color="orange")
-    plt.xlabel("Time Steps")
-    plt.ylabel("Malicious Comments Count")
+    plt.xlabel("时间步（小时）")
+    plt.ylabel("恶意评论数量")
     plt.legend()
-
-    # 保存图像
+    plt.title(test_event_name + " 预测结果")
     save_path = os.path.join(output_dir, f"{test_event_name}_prediction.png")
     plt.savefig(save_path)
-    print(f"Prediction plot saved to {save_path}")
+    plt.close()
+    print(f"预测图已保存到 {save_path}")
 
-# 打印平均误差
+# 平均误差打印
 print(f"Average MAE: {sum(mae_list)/len(mae_list):.4f}")
 print(f"Average MSE: {sum(mse_list)/len(mse_list):.4f}")
 print(f"Average RMSE: {sum(rmse_list)/len(rmse_list):.4f}")
