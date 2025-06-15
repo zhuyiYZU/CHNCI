@@ -17,7 +17,7 @@ output_dir = r"C:\Users\zxnb\Desktop\DLinear_res"
 os.makedirs(output_dir, exist_ok=True)  # 创建文件夹，如果不存在
 error_file_path = os.path.join(output_dir, "error_metrics.txt")
 
-# -------- 这里替换为真正的 DLinear 模型 --------
+
 class DLinear(nn.Module):
     def __init__(self, seq_len=6, pred_len=1):
         super(DLinear, self).__init__()
