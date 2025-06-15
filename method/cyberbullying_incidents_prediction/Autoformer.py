@@ -20,43 +20,65 @@ error_file_path = os.path.join(output_dir, "error_metrics.txt")
 # 使用 GPU 加速
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# **Autoformer 核心模块**
-class AutoCorrelation(nn.Module):
-    def __init__(self, d_model, nhead):
-        super(AutoCorrelation, self).__init__()
+class SeriesDecomposition(nn.Module):
+    def __init__(self, kernel_size):
+        super(SeriesDecomposition, self).__init__()
+        self.moving_avg = nn.AvgPool1d(kernel_size=kernel_size, stride=1, padding=kernel_size//2)
+
+    def forward(self, x):
+        # x: [B, T, C]
+        moving_mean = self.moving_avg(x.permute(0, 2, 1)).permute(0, 2, 1)
+        seasonal = x - moving_mean
+        trend = moving_mean
+        return seasonal, trend
+
+class AutoCorrelationLayer(nn.Module):
+    def __init__(self, d_model):
+        super(AutoCorrelationLayer, self).__init__()
         self.query = nn.Linear(d_model, d_model)
         self.key = nn.Linear(d_model, d_model)
         self.value = nn.Linear(d_model, d_model)
-        self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x):
-        # 计算 Auto-Correlation Attention
-        Q = self.query(x)
-        K = self.key(x)
-        V = self.value(x)
-        attn_weights = self.softmax(Q @ K.transpose(-2, -1) / (x.size(-1) ** 0.5))
-        return attn_weights @ V
+        # x: [B, T, C]
+        Q, K, V = self.query(x), self.key(x), self.value(x)
+        attn = torch.matmul(Q, K.transpose(-1, -2)) / (Q.shape[-1] ** 0.5)
+        attn = torch.softmax(attn, dim=-1)
+        out = torch.matmul(attn, V)
+        return out
 
-# **Autoformer 模型架构**
+class AutoformerLayer(nn.Module):
+    def __init__(self, d_model, kernel_size):
+        super(AutoformerLayer, self).__init__()
+        self.decomp = SeriesDecomposition(kernel_size)
+        self.auto_corr = AutoCorrelationLayer(d_model)
+        self.linear = nn.Linear(d_model, d_model)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        # x: [B, T, C]
+        seasonal, trend = self.decomp(x)
+        seasonal = self.auto_corr(seasonal)
+        trend = self.linear(trend)
+        out = seasonal + trend
+        return self.relu(out)
+
 class Autoformer(nn.Module):
-    def __init__(self, input_size=1, d_model=64, nhead=8, num_encoder_layers=3, dim_feedforward=128, dropout=0.1, seq_len=6):
-        super(Autoformer, self).__init__()
+    def __init__(self, input_size=1, d_model=64, num_layers=3, kernel_size=3, seq_len=6):
+        super(TrueAutoformer, self).__init__()
         self.embedding = nn.Linear(input_size, d_model)
-        self.encoder_layer = nn.ModuleList([
-            nn.Sequential(
-                AutoCorrelation(d_model, nhead),
-                nn.Linear(d_model, d_model),
-                nn.ReLU()
-            ) for _ in range(num_encoder_layers)
+        self.layers = nn.ModuleList([
+            AutoformerLayer(d_model, kernel_size) for _ in range(num_layers)
         ])
-        self.fc = nn.Linear(d_model, 1)
+        self.projection = nn.Linear(d_model, 1)
 
-    def forward(self, src):
-        src = self.embedding(src)  # (batch_size, time_steps, d_model)
-        for layer in self.encoder_layer:
-            src = layer(src)  # 自相关模块
-        output = self.fc(src[:, -1, :])  # 直接取最后一个时间步
-        return output
+    def forward(self, x):
+        # x: [B, T, input_size]
+        x = self.embedding(x)
+        for layer in self.layers:
+            x = layer(x)
+        return self.projection(x[:, -1, :])  # 只取最后时间步输出
+
 
 # 定义滑动窗口函数
 time_steps = 6  # 使用过去6小时的数据预测未来的趋势
@@ -68,7 +90,7 @@ def create_sequences(data, time_steps=6):
     return np.array(X), np.array(y)
 
 # 初始化模型
-model = Autoformer(d_model=64, nhead=8, num_encoder_layers=3).to(device)
+model = Autoformer(d_model=64, num_layers=3, kernel_size=3).to(device)
 loss_function = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
