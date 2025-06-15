@@ -80,7 +80,7 @@ train_file_paths = {
     "徐州多人占铁轨拍照逼停火车头(2)": r"/home/ubuntu/zx/data/徐州多人占铁轨拍照逼停火车头(2).csv",
     "武磊回应遭球迷辱骂": r"/home/ubuntu/zx/data/武磊回应遭球迷辱骂.csv",
     "小区业主": r"/home/ubuntu/zx/data/小区业主.csv",
-    "韩国冠军被霸凌": r"/home/ubuntu/zx/data/董宇辉.csv",
+    "董宇辉": r"/home/ubuntu/zx/data/董宇辉.csv",
 }
 data_folder = r"/home/ubuntu/zx/data"
 
