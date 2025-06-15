@@ -21,14 +21,24 @@ error_file_path = os.path.join(output_dir, "error_metrics.txt")
 class NLinear(nn.Module):
     def __init__(self, input_size=6, output_size=1):
         super(NLinear, self).__init__()
-        self.linear = nn.Linear(input_size, output_size)
-        self.activation = nn.ReLU()  # 增加非线性激活层
+        self.linear = nn.Linear(input_size, output_size)  # 纯线性层，无激活函数
 
     def forward(self, src):
-        # src: (batch_size, time_steps, 1)
-        src = src.squeeze(-1)  # 去掉最后一个维度，变成 (batch_size, time_steps)
-        output = self.linear(src)  # (batch_size, output_size)
-        return self.activation(output)  # 通过激活函数映射为非线性输出
+        # 输入 src 形状: (batch_size, seq_len, 1)
+        last_val = src[:, -1:, :]  # 提取最后一个时间点的值 (batch_size, 1, 1)
+        
+        # 关键步骤1：输入归一化（减去最后一个值）
+        normalized_src = src - last_val  # (batch_size, seq_len, 1)
+        
+        # 通过线性层
+        normalized_src = normalized_src.squeeze(-1)  # 降维 (batch_size, seq_len)
+        normalized_output = self.linear(normalized_src)  # (batch_size, output_size)
+        normalized_output = normalized_output.unsqueeze(-1)  # 恢复维度 (batch_size, output_size, 1)
+        
+        # 关键步骤2：反归一化（加回最后一个值）
+        output = normalized_output + last_val  # (batch_size, output_size, 1)
+        
+        return output.squeeze(-1)  # 输出形状: (batch_size, output_size)
 
 # 定义滑动窗口函数
 time_steps = 6  # 使用过去6小时的数据预测未来的趋势
