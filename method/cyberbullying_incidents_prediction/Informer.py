@@ -21,21 +21,108 @@ error_file_path = os.path.join(output_dir, "error_metrics.txt")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Informer 模型架构定义
-class Informer(nn.Module):
-    def __init__(self, input_size=1, d_model=64, nhead=8, num_encoder_layers=3, dim_feedforward=128, dropout=0.1, seq_len=6):
-        super(Informer, self).__init__()
-        self.embedding = nn.Linear(input_size, d_model)  # 输入嵌入层
-        self.encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout)
-        self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=num_encoder_layers)
-        self.fc = nn.Linear(d_model, 1)  # 输出层
+class ProbSparseSelfAttention(nn.Module):
+    def __init__(self, d_model, n_heads, factor=5):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.factor = factor  # 控制稀疏度
+        self.scale = 1 / math.sqrt(self.d_head)
 
-    def forward(self, src):
-        src = self.embedding(src)  # (batch_size, time_steps, d_model)
-        src = src.transpose(0, 1)  # (time_steps, batch_size, d_model) for transformer input
-        output = self.transformer_encoder(src)  # 经过 Encoder
-        output = output[-1, :, :]  # 只取最后一个时间步的输出
-        output = self.fc(output)  # (batch_size, 1)
-        return output
+        self.q_linear = nn.Linear(d_model, d_model)
+        self.k_linear = nn.Linear(d_model, d_model)
+        self.v_linear = nn.Linear(d_model, d_model)
+        self.out = nn.Linear(d_model, d_model)
+
+    def _prob_QK(self, Q, K, sample_k, n_top):
+        # Q, K shape: [batch, heads, length, d_head]
+        B, H, L_Q, D = Q.shape
+        _, _, L_K, _ = K.shape
+
+        # 采样部分K点进行近似
+        K_expand = K.unsqueeze(-3).expand(B, H, L_Q, L_K, D)
+        index_sample = torch.randint(L_K, (sample_k,), device=Q.device)
+        K_sample = K_expand[:, :, :, index_sample, :]
+
+        Q_K_sample = torch.matmul(Q.unsqueeze(-2), K_sample.transpose(-2, -1)).squeeze(-2)  # [B,H,L_Q,sample_k]
+
+        M = Q_K_sample.max(-1)[0] - Q_K_sample.mean(-1)  # 重要性度量
+        M_top = torch.topk(M, n_top, dim=-1)[1]  # 选出重要的 query 索引
+        return M_top
+
+    def forward(self, Q, K, V, mask=None):
+        B, L, _ = Q.shape
+        H = self.n_heads
+        d_head = self.d_head
+
+        Q = self.q_linear(Q).view(B, L, H, d_head).transpose(1,2)  # [B,H,L,d_head]
+        K = self.k_linear(K).view(B, -1, H, d_head).transpose(1,2)  # [B,H,L_K,d_head]
+        V = self.v_linear(V).view(B, -1, H, d_head).transpose(1,2)  # [B,H,L_V,d_head]
+
+        # ProbSparse Attention 关键步骤
+        u = int(math.ceil(math.log(L)))  # sample_k = c*log(L)
+        u = max(u * self.factor, 1)
+        u = int(u)
+        n_top = u  # 选取前n_top个 query
+        M_top = self._prob_QK(Q, K, sample_k=u, n_top=n_top)  # [B,H,n_top]
+
+        # 只计算 top query 对应的 attention
+        Q_reduce = torch.gather(Q, 2, M_top.unsqueeze(-1).expand(-1, -1, -1, d_head))  # [B,H,n_top,d_head]
+        scores = torch.matmul(Q_reduce, K.transpose(-2,-1)) * self.scale  # [B,H,n_top,L_K]
+
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1)  # [B,H,n_top,L_K]
+        context = torch.matmul(attn, V)  # [B,H,n_top,d_head]
+
+        # 将 sparse 计算结果重新填充回全部 query 位置（简化版中仅返回 top query的结果）
+        # 实际完整实现会有补全机制，这里为了示例略去
+
+        # 这里先做个简单的聚合
+        context_mean = context.mean(dim=2)  # [B,H,d_head]
+
+        context_mean = context_mean.transpose(1,2).contiguous().view(B, -1)  # [B, H*d_head]
+        out = self.out(context_mean.unsqueeze(1))  # [B,1,d_model]
+
+        return out.squeeze(1)  # [B, d_model]
+
+class InformerEncoderLayer(nn.Module):
+    def __init__(self, d_model, n_heads, dim_feedforward=256, dropout=0.1):
+        super().__init__()
+        self.attn = ProbSparseSelfAttention(d_model, n_heads)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Linear(dim_feedforward, d_model)
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        attn_out = self.attn(x, x, x)
+        x = self.norm1(x + self.dropout(attn_out))
+        ff_out = self.ff(x)
+        x = self.norm2(x + self.dropout(ff_out))
+        return x
+
+class Informer(nn.Module):
+    def __init__(self, input_size=1, d_model=64, n_heads=8, num_layers=2, dim_feedforward=256, dropout=0.1, seq_len=24, pred_len=1):
+        super().__init__()
+        self.embedding = nn.Linear(input_size, d_model)
+        self.layers = nn.ModuleList([InformerEncoderLayer(d_model, n_heads, dim_feedforward, dropout) for _ in range(num_layers)])
+        self.proj = nn.Linear(d_model, pred_len)
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+
+    def forward(self, x):
+        # x shape: [B, seq_len, input_size]
+        x = self.embedding(x)
+        for layer in self.layers:
+            x = layer(x)
+        out = self.proj(x[:, -self.pred_len:, :]).squeeze(-1)  # 预测最后 pred_len 个时间步
+        return out
 
 # 定义滑动窗口函数
 time_steps = 6  # 使用过去6小时的数据预测未来的趋势
@@ -47,7 +134,7 @@ def create_sequences(data, time_steps=6):
     return np.array(X), np.array(y)
 
 # 初始化模型
-model = Informer(d_model=64, nhead=8, num_encoder_layers=3).to(device)
+model = Informer(input_size=1, d_model=64, n_heads=8, num_layers=2, dim_feedforward=256, dropout=0.1, seq_len=24, pred_len=1).to(device)
 loss_function = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
