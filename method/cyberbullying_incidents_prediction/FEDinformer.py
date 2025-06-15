@@ -20,45 +20,59 @@ error_file_path = os.path.join(output_dir, "error_metrics.txt")
 # 使用 GPU 加速
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# **FEDformer 核心模块**
-class FrequencyBlock(nn.Module):
-    def __init__(self, d_model, seq_len):
-        super(FrequencyBlock, self).__init__()
-        self.seq_len = seq_len
-        self.d_model = d_model
-        self.proj = nn.Linear(d_model, d_model)  # 投影层
-
+class SeriesDecomposition(nn.Module):
+    def __init__(self, kernel_size=25):
+        super().__init__()
+        self.moving_avg = nn.AvgPool1d(kernel_size, stride=1, padding=kernel_size//2)
     def forward(self, x):
-        # 转换到频域
-        freq = torch.fft.rfft(x, dim=1)  # 频域信号 (batch_size, seq_len//2+1, d_model)
-        freq_real = freq.real  # 实部
-        freq_imag = freq.imag  # 虚部
+        # x: [B, T, C]
+        mean = self.moving_avg(x.permute(0,2,1)).permute(0,2,1)
+        return x - mean, mean
 
-        # 分别处理实部和虚部
-        freq_real = self.proj(freq_real)
-        freq_imag = self.proj(freq_imag)
+class FrequencyBlock(nn.Module):
+    def __init__(self, d_model, keep_ratio=0.5):
+        super().__init__()
+        self.d_model = d_model
+        self.keep_ratio = keep_ratio
+        self.proj = nn.Linear(d_model, d_model)
+    def forward(self, x):
+        # x: [B, T, C]
+        freq = torch.fft.rfft(x, dim=1)
+        real = self.proj(freq.real)
+        imag = self.proj(freq.imag)
+        freq = torch.complex(real, imag)
+        return torch.fft.irfft(freq, n=x.size(1), dim=1)
 
-        # 合成频域信号
-        freq = torch.complex(freq_real, freq_imag)
+class FEDformerEncoderLayer(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.decomp = SeriesDecomposition()
+        self.freq_block = FrequencyBlock(d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(0.1)
+    def forward(self, x):
+        seasonal, trend = self.decomp(x)
+        seasonal = self.freq_block(seasonal)
+        x = seasonal + trend
+        return self.dropout(self.norm(x))
 
-        # 转回时域
-        time = torch.fft.irfft(freq, n=self.seq_len, dim=1)  # (batch_size, seq_len, d_model)
-        return time
-
-# **FEDformer 模型架构**
 class FEDformer(nn.Module):
-    def __init__(self, input_size=1, d_model=64, num_blocks=3, seq_len=6):
-        super(FEDformer, self).__init__()
-        self.embedding = nn.Linear(input_size, d_model)
-        self.blocks = nn.ModuleList([FrequencyBlock(d_model, seq_len) for _ in range(num_blocks)])
-        self.fc = nn.Linear(d_model, 1)
-
-    def forward(self, src):
-        src = self.embedding(src)  # (batch_size, seq_len, d_model)
-        for block in self.blocks:
-            src = block(src)  # 频域建模
-        output = self.fc(src[:, -1, :])  # 取最后一个时间步
-        return output
+    def __init__(self, input_size=1, d_model=64, num_layers=3, seq_len=24, pred_len=1):
+        super().__init__()
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.emb = nn.Linear(input_size, d_model)
+        self.enc_layers = nn.ModuleList([
+            FEDformerEncoderLayer(d_model) for _ in range(num_layers)
+        ])
+        self.proj = nn.Linear(d_model, pred_len)
+    def forward(self, x):
+        # x: [B, T_in, input_size]
+        x = self.emb(x)
+        for layer in self.enc_layers:
+            x = layer(x)
+        out = self.proj(x[:, -self.pred_len:, :])  # 支持多步输出
+        return out.squeeze(-1)
 
 # 定义滑动窗口函数
 time_steps = 6  # 使用过去6小时的数据预测未来的趋势
@@ -70,7 +84,7 @@ def create_sequences(data, time_steps=6):
     return np.array(X), np.array(y)
 
 # 初始化模型
-model = FEDformer(d_model=64, num_blocks=3).to(device)
+model = FEDformer(input_size=1, d_model=64, num_layers=3, seq_len=seq_len, pred_len=pred_len).to(device)
 loss_function = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
